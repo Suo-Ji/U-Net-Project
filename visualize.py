@@ -223,17 +223,26 @@ def predict_custom_images(model, image_paths, device, save_dir, model_name="mode
 # 对比可视化
 # ============================================================
 
-def compare_training(history_a, history_b, dataset_name, save_dir,
-                     name_a="U-Net", name_b="SegNet"):
+def compare_training(histories, dataset_name, save_dir,
+                     model_names=None, display_names=None):
     """
-    绘制两个模型的训练曲线对比图
+    绘制多个模型的训练曲线对比图
 
     参数:
-        history_a, history_b: 两个模型的训练历史
+        histories: dict，key 为模型名称，value 为训练历史字典
         dataset_name: 数据集名称
         save_dir: 保存目录
-        name_a, name_b: 两个模型的显示名称
+        model_names: 模型 key 列表（默认取 histories 的所有 key）
+        display_names: 显示名称列表
     """
+    if model_names is None:
+        model_names = list(histories.keys())
+    if display_names is None:
+        display_names = model_names
+
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
+    markers = ["o", "s", "^", "D", "v"]
+
     metrics_to_plot = [
         ("train_loss", "Train Loss"),
         ("val_loss", "Val Loss"),
@@ -250,18 +259,20 @@ def compare_training(history_a, history_b, dataset_name, save_dir,
     axes = axes.flatten()
 
     for i, (key, title) in enumerate(metrics_to_plot):
-        if key in history_a and len(history_a[key]) > 0:
-            epochs = range(1, len(history_a[key]) + 1)
-            axes[i].plot(epochs, history_a[key], label=name_a, marker="o", markersize=2)
-        if key in history_b and len(history_b[key]) > 0:
-            epochs = range(1, len(history_b[key]) + 1)
-            axes[i].plot(epochs, history_b[key], label=name_b, marker="s", markersize=2)
+        for j, name in enumerate(model_names):
+            h = histories.get(name, {})
+            if key in h and len(h[key]) > 0:
+                epochs = range(1, len(h[key]) + 1)
+                axes[i].plot(epochs, h[key], label=display_names[j],
+                             color=colors[j % len(colors)],
+                             marker=markers[j % len(markers)], markersize=2)
         axes[i].set_title(title, fontsize=12)
         axes[i].set_xlabel("Epoch")
         axes[i].legend()
         axes[i].grid(True, alpha=0.3)
 
-    plt.suptitle(f"{name_a} vs {name_b} — {dataset_name.upper()}", fontsize=16, fontweight="bold")
+    title_str = " vs ".join(display_names)
+    plt.suptitle(f"{title_str} — {dataset_name.upper()}", fontsize=16, fontweight="bold")
     plt.tight_layout()
     os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(save_dir, f"{dataset_name}_compare_training.png")
@@ -270,28 +281,33 @@ def compare_training(history_a, history_b, dataset_name, save_dir,
     plt.show()
 
 
-def compare_prediction(model_a, model_b, val_loader, device, dataset_name, save_dir,
-                       name_a="U-Net", name_b="SegNet", num_samples=3):
+def compare_prediction(models, val_loader, device, dataset_name, save_dir,
+                       model_names=None, display_names=None, num_samples=3):
     """
-    同一张图上并排展示两个模型的预测结果
+    同一张图上并排展示多个模型的预测结果
 
     参数:
-        model_a, model_b: 两个训练好的模型
+        models: 模型实例列表
         val_loader: 验证集 DataLoader
         device: 计算设备
         dataset_name: 数据集名称
         save_dir: 保存目录
-        name_a, name_b: 两个模型的显示名称
+        model_names: 模型 key 列表
+        display_names: 显示名称列表
         num_samples: 展示的样本数量
     """
-    model_a.eval()
-    model_b.eval()
+    if display_names is None:
+        display_names = model_names if model_names else [f"Model {i}" for i in range(len(models))]
+
+    for m in models:
+        m.eval()
 
     samples = list(val_loader)
     selected = random.sample(range(len(samples)), min(num_samples, len(samples)))
 
-    # 4 列：Input / GT / Model A Prediction / Model B Prediction
-    fig, axes = plt.subplots(num_samples, 4, figsize=(20, 5 * num_samples))
+    # 列数：Input + GT + 每个模型一列
+    n_cols = 2 + len(models)
+    fig, axes = plt.subplots(num_samples, n_cols, figsize=(5 * n_cols, 5 * num_samples))
     if num_samples == 1:
         axes = axes[np.newaxis, :]
 
@@ -300,16 +316,8 @@ def compare_prediction(model_a, model_b, val_loader, device, dataset_name, save_
         image = image.to(device)
         mask = mask.to(device)
 
-        with torch.no_grad():
-            pred_a = torch.sigmoid(model_a(image))
-            pred_b = torch.sigmoid(model_b(image))
-            pred_mask_a = (pred_a > 0.5).float()
-            pred_mask_b = (pred_b > 0.5).float()
-
         img_np = denormalize(image[0])
         mask_np = mask[0, 0].cpu().numpy()
-        pred_a_np = pred_mask_a[0, 0].cpu().numpy()
-        pred_b_np = pred_mask_b[0, 0].cpu().numpy()
 
         axes[row, 0].imshow(img_np)
         axes[row, 0].set_title("Input Image", fontsize=12)
@@ -319,15 +327,18 @@ def compare_prediction(model_a, model_b, val_loader, device, dataset_name, save_
         axes[row, 1].set_title("Ground Truth", fontsize=12)
         axes[row, 1].axis("off")
 
-        axes[row, 2].imshow(pred_a_np, cmap="gray", vmin=0, vmax=1)
-        axes[row, 2].set_title(f"{name_a}", fontsize=12)
-        axes[row, 2].axis("off")
+        for j, model in enumerate(models):
+            with torch.no_grad():
+                pred = torch.sigmoid(model(image))
+                pred_mask = (pred > 0.5).float()
 
-        axes[row, 3].imshow(pred_b_np, cmap="gray", vmin=0, vmax=1)
-        axes[row, 3].set_title(f"{name_b}", fontsize=12)
-        axes[row, 3].axis("off")
+            pred_np = pred_mask[0, 0].cpu().numpy()
+            axes[row, 2 + j].imshow(pred_np, cmap="gray", vmin=0, vmax=1)
+            axes[row, 2 + j].set_title(display_names[j], fontsize=12)
+            axes[row, 2 + j].axis("off")
 
-    plt.suptitle(f"{name_a} vs {name_b} — {dataset_name.upper()}", fontsize=16, fontweight="bold")
+    title_str = " vs ".join(display_names)
+    plt.suptitle(f"{title_str} — {dataset_name.upper()}", fontsize=16, fontweight="bold")
     plt.tight_layout()
     os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(save_dir, f"{dataset_name}_compare_prediction.png")
@@ -336,12 +347,22 @@ def compare_prediction(model_a, model_b, val_loader, device, dataset_name, save_
     plt.show()
 
 
-def print_comparison_table(history_a, history_b, dataset_name,
-                           name_a="U-Net", name_b="SegNet"):
+def print_comparison_table(histories, dataset_name,
+                           model_names=None, display_names=None):
     """
-    在终端打印两个模型的指标对比表
+    在终端打印多个模型的指标对比表
+
+    参数:
+        histories: dict，key 为模型名称，value 为训练历史字典
+        dataset_name: 数据集名称
+        model_names: 模型 key 列表
+        display_names: 显示名称列表
     """
-    # 取最后一个 epoch 的值
+    if model_names is None:
+        model_names = list(histories.keys())
+    if display_names is None:
+        display_names = model_names
+
     def last(h, key):
         vals = h.get(key, [])
         return vals[-1] if vals else 0.0
@@ -357,38 +378,53 @@ def print_comparison_table(history_a, history_b, dataset_name,
         ("ECE",          "val_ece",       False),
     ]
 
+    n = len(model_names)
+    col_width = 12
+    row_width = 14 + n * (col_width + 3)
+    sep = "=" * row_width
+
+    title_str = " vs ".join(display_names)
     print()
-    print("=" * 65)
-    print(f"  {name_a} vs {name_b} — {dataset_name.upper()} 对比结果")
-    print("=" * 65)
-    print(f"  {'指标':<14} {name_a:>12}   {name_b:>12}   {'差值':>10}")
-    print("-" * 65)
+    print(sep)
+    print(f"  {title_str} — {dataset_name.upper()} 对比结果")
+    print(sep)
+
+    # 表头
+    header = f"  {'指标':<14}"
+    for name in display_names:
+        header += f"  {name:>{col_width}}"
+    print(header)
+    print("-" * row_width)
 
     for label, key, higher_better in metrics:
-        va = last(history_a, key)
-        vb = last(history_b, key)
-        diff = vb - va
-        sign = "+" if diff >= 0 else ""
-        # 标记更优的一方
-        marker = ""
-        if higher_better:
-            marker = " *" if va > vb else ("  " if va == vb else "  ")
-        else:
-            marker = " *" if va < vb else ("  " if va == vb else "  ")
-        print(f"  {label:<14} {va:>12.4f}   {vb:>12.4f}   {sign}{diff:>9.4f}{marker}")
+        values = [last(histories.get(name, {}), key) for name in model_names]
+        best = max(values) if higher_better else min(values)
+
+        row_str = f"  {label:<14}"
+        for v in values:
+            marker = " *" if v == best else "  "
+            row_str += f"  {v:>{col_width}.4f}{marker}"
+        print(row_str)
 
     # 额外指标
-    print("-" * 65)
-    fps_a = history_a.get("inference_fps", 0)
-    fps_b = history_b.get("inference_fps", 0)
-    gpu_a = history_a.get("gpu_memory_mb", 0)
-    gpu_b = history_b.get("gpu_memory_mb", 0)
-    time_a = sum(history_a.get("epoch_time", []))
-    time_b = sum(history_b.get("epoch_time", []))
+    print("-" * row_width)
 
-    print(f"  {'显存(MB)':<14} {gpu_a:>12.1f}   {gpu_b:>12.1f}   {sign}{gpu_b - gpu_a:>9.1f}")
-    print(f"  {'推理FPS':<14} {fps_a:>12.1f}   {fps_b:>12.1f}   {sign}{fps_b - fps_a:>9.1f}")
-    print(f"  {'总训练耗时(s)':<14} {time_a:>12.1f}   {time_b:>12.1f}   {sign}{time_b - time_a:>9.1f}")
-    print("=" * 65)
+    extra_metrics = [
+        ("显存(MB)",     lambda h: h.get("gpu_memory_mb", 0),       ".1f"),
+        ("推理FPS",      lambda h: h.get("inference_fps", 0),       ".1f"),
+        ("总训练耗时(s)", lambda h: sum(h.get("epoch_time", [])),   ".1f"),
+    ]
+
+    for label, extract, fmt in extra_metrics:
+        values = [extract(histories.get(name, {})) for name in model_names]
+        best = max(values) if "FPS" in label else min(values)
+
+        row_str = f"  {label:<14}"
+        for v in values:
+            marker = " *" if v == best else "  "
+            row_str += f"  {v:>{col_width}{fmt}}{marker}"
+        print(row_str)
+
+    print(sep)
     print("  * 表示该指标更优的一方")
     print()
