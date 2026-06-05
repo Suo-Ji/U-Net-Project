@@ -4,17 +4,8 @@
 
 import os
 
-# -------------------- 数据集路径 --------------------
-# CamVid 数据集根目录，需包含以下子目录结构：
-#   CamVid/
-#     train/          - 训练图像
-#     train_labels/   - 训练标签（彩色掩膜）
-#     val/            - 验证图像
-#     val_labels/     - 验证标签
-#     test/           - 测试图像
-#     test_labels/    - 测试标签
-#     class_dict.csv  - 类别定义文件（类别名,R,G,B）
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CamVid")
+# -------------------- 项目根目录 --------------------
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # -------------------- 图像尺寸 --------------------
 IMG_HEIGHT = 256
@@ -42,5 +33,52 @@ NUM_WORKERS = 4                  # DataLoader 工作线程数
 SEED = 42                        # 随机种子，确保可复现
 DEVICE = "cuda"                  # 使用的设备 ("cuda" 或 "cpu")
 
-# 模型保存路径
-MODEL_SAVE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best_model.pth")
+# -------------------- 支持的数据集和模型 --------------------
+VALID_DATASETS = ("camvid", "cityscapes")
+VALID_MODELS = ("unet", "segnet")
+
+
+def get_config(dataset_name, model_name="unet"):
+    """
+    根据数据集名称和模型名称返回对应的配置字典
+
+    参数:
+        dataset_name: 数据集名称，"camvid" 或 "cityscapes"
+        model_name: 模型名称，"unet" 或 "segnet"
+
+    返回:
+        dict: 包含 data_dir, model_save_path, figure_dir 等配置
+    """
+    dataset_name = dataset_name.lower()
+    model_name = model_name.lower()
+
+    if dataset_name not in VALID_DATASETS:
+        raise ValueError(f"不支持的数据集: {dataset_name}，可选: {VALID_DATASETS}")
+    if model_name not in VALID_MODELS:
+        raise ValueError(f"不支持的模型: {model_name}，可选: {VALID_MODELS}")
+
+    if dataset_name == "camvid":
+        data_dir = os.path.join(PROJECT_DIR, "CamVid")
+    else:  # cityscapes
+        data_dir = os.path.join(PROJECT_DIR, "Cityscapes")
+
+    # 模型权重保存目录: checkpoints/{dataset}/
+    checkpoint_dir = os.path.join(PROJECT_DIR, "checkpoints", dataset_name)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    # 可视化图片保存目录: figure/{dataset}/
+    figure_dir = os.path.join(PROJECT_DIR, "figure", dataset_name)
+    os.makedirs(figure_dir, exist_ok=True)
+
+    # 对比可视化目录: figure/comparison/
+    comparison_dir = os.path.join(PROJECT_DIR, "figure", "comparison")
+    os.makedirs(comparison_dir, exist_ok=True)
+
+    return {
+        "dataset_name": dataset_name,
+        "model_name": model_name,
+        "data_dir": data_dir,
+        "model_save_path": os.path.join(checkpoint_dir, f"{model_name}_best_model.pth"),
+        "figure_dir": figure_dir,
+        "comparison_dir": comparison_dir,
+    }

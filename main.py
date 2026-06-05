@@ -6,40 +6,35 @@
 #   pip install torch torchvision
 #   pip install albumentations
 #   pip install opencv-python
-
 #   pip install matplotlib
 #   pip install tqdm
 #   pip install pillow
 #
-# 数据集说明：
-#   请下载 CamVid 数据集并放置于项目根目录的 CamVid/ 文件夹中
-#   目录结构应为：
-#     CamVid/
-#       train/          - 训练图像 (.png)
-#       trainannot/     - 训练标签（灰度索引图，Road 类别索引 = 3）
-#       val/            - 验证图像
-#       valannot/       - 验证标签
-#       test/           - 测试图像
-#       testannot/      - 测试标签
+# 运行方式：
+#   python main.py <数据集> <模型>                        训练
+#   python main.py test <数据集> <模型>                  测试可视化
+#   python main.py predict <数据集> <模型> [图片...]      预测
+#   python main.py compare <数据集>                       对比两个模型
 #
-#   CamVid 数据集下载地址：
-#     https://www.kaggle.com/datasets/carlolepelaars/camvid
-#     或
-#     http://mi.eng.cam.ac.uk/research/projects/VideoRec/CamVid/
+#   <数据集>: camvid 或 cityscapes
+#   <模型>:   unet 或 segnet
 #
 # ============================================================
 
 import os
 import random
 import sys
+import json
 
 import numpy as np
 import torch
 
 import config
-from model import UNet
-from train import train
-from visualize import visualize_prediction, plot_training_history, predict_custom_images
+from model import UNet, SegNet, get_model_class
+from train import train, create_dataloaders, measure_inference_speed, measure_gpu_memory
+from visualize import (visualize_prediction, plot_training_history,
+                       predict_custom_images, compare_training,
+                       compare_prediction, print_comparison_table)
 
 
 def set_seed(seed):
@@ -54,71 +49,125 @@ def set_seed(seed):
         torch.backends.cudnn.benchmark = False
 
 
-def main():
-    # 设置随机种子
-    set_seed(config.SEED)
+def _create_model(model_name, device):
+    """创建模型并加载到设备"""
+    ModelClass = get_model_class(model_name)
+    model = ModelClass(in_channels=3, out_channels=1, num_filters=config.NUM_FILTERS)
+    model = model.to(device)
+    return model
 
-    # 选择设备
+
+def _load_model(model_name, cfg, device):
+    """加载已有模型权重"""
+    model = _create_model(model_name, device)
+    model.load_state_dict(torch.load(cfg["model_save_path"], map_location=device, weights_only=True))
+    model = model.to(device)
+    return model
+
+
+def _print_model_info(model, model_name):
+    """打印模型参数量"""
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"模型: {model_name.upper()}  |  参数量: {total_params:,} (可训练: {trainable_params:,})")
+
+
+def print_usage():
+    """打印使用帮助"""
+    print("""
+使用方式:
+  python main.py <数据集> <模型>                         训练模型
+  python main.py test <数据集> <模型>                   测试可视化
+  python main.py predict <数据集> <模型>                批量预测 images/ 下的图片
+  python main.py predict <数据集> <模型> <图片1> <图片2> 预测指定图片
+  python main.py compare <数据集>                       对比两个模型
+
+  <数据集>: camvid 或 cityscapes
+  <模型>:   unet 或 segnet
+""")
+
+
+def do_train(dataset_name, model_name):
+    """训练指定数据集和模型"""
+    cfg = config.get_config(dataset_name, model_name)
+
+    set_seed(config.SEED)
     device = torch.device(config.DEVICE if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}")
 
-    # 检查数据集目录是否存在
-    if not os.path.isdir(config.DATA_DIR):
-        print(f"\n错误: 数据集目录不存在: {config.DATA_DIR}")
-        print("请先下载 CamVid 数据集并解压到项目根目录的 CamVid/ 文件夹中。")
-        print("下载地址: https://www.kaggle.com/datasets/carlolepelaars/camvid")
+    # 检查数据集目录
+    if not os.path.isdir(cfg["data_dir"]):
+        print(f"\n错误: 数据集目录不存在: {cfg['data_dir']}")
         return
 
-    # 创建 U-Net 模型
-    model = UNet(in_channels=3, out_channels=1, num_filters=config.NUM_FILTERS)
-    model = model.to(device)
+    # 创建模型
+    model = _create_model(model_name, device)
+    _print_model_info(model, model_name)
 
-    # 打印模型参数量
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"模型参数量: {total_params:,} (可训练: {trainable_params:,})")
-
-    # ========== 训练 ==========
-    model, test_loader, history = train(model, device)
+    # 训练（JSON 已在训练过程中实时写入）
+    model, val_loader, history = train(model, device, dataset_name, model_name, cfg)
 
     # 绘制训练历史曲线
-    plot_training_history(history)
+    plot_training_history(history, cfg["figure_dir"], model_name)
 
-    # 加载最佳模型进行测试可视化
-    print("\n加载最佳模型进行预测可视化...")
-    model.load_state_dict(torch.load(config.MODEL_SAVE_PATH, map_location=device, weights_only=True))
-    model = model.to(device)
-
-    # ========== 可视化测试结果 ==========
-    visualize_prediction(model, test_loader, device, num_samples=3)
+    # 加载最佳模型，使用验证集进行预测可视化
+    print("\n加载最佳模型，使用验证集进行预测可视化...")
+    model = _load_model(model_name, cfg, device)
+    visualize_prediction(model, val_loader, device, cfg["figure_dir"], model_name, num_samples=3)
 
 
-def predict():
-    """
-    使用已训练好的模型对自定义图片进行道路分割预测
+def do_test(dataset_name, model_name):
+    """加载已有权重，运行测试可视化"""
+    cfg = config.get_config(dataset_name, model_name)
 
-    用法：
-        # 方式一：将图片放入项目目录下的 images/ 文件夹，然后运行：
-        python main.py predict
+    device = torch.device(config.DEVICE if torch.cuda.is_available() else "cpu")
+    print(f"使用设备: {device}")
 
-        # 方式二：直接指定图片路径：
-        python main.py predict photo1.jpg photo2.png
-    """
+    # 检查模型权重
+    if not os.path.isfile(cfg["model_save_path"]):
+        print(f"\n错误: 模型权重不存在: {cfg['model_save_path']}")
+        print(f"请先运行 python main.py {dataset_name} {model_name} 完成训练")
+        return
+
+    # 检查数据集目录
+    if not os.path.isdir(cfg["data_dir"]):
+        print(f"\n错误: 数据集目录不存在: {cfg['data_dir']}")
+        return
+
+    # 加载模型
+    model = _load_model(model_name, cfg, device)
+    _print_model_info(model, model_name)
+
+    # 使用验证集进行可视化
+    _, val_loader, _ = create_dataloaders(dataset_name, cfg)
+    visualize_prediction(model, val_loader, device, cfg["figure_dir"], model_name, num_samples=3)
+
+    # 打印推理速度和显存
+    fps = measure_inference_speed(model, val_loader, device)
+    gpu_mem = measure_gpu_memory(model, val_loader, device)
+    print(f"推理速度: {fps:.1f} FPS  |  显存占用: {gpu_mem:.1f} MB")
+
+
+def do_predict(dataset_name, model_name):
+    """使用已训练好的模型对自定义图片进行道路分割预测"""
     EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp')
 
-    # 确定图片来源：命令行传入 或 自动扫描 images/ 目录
-    if len(sys.argv) >= 3:
-        image_paths = sys.argv[2:]
+    cfg = config.get_config(dataset_name, model_name)
+
+    # 确定图片来源
+    # sys.argv: [main.py, predict, <dataset>, <model>, <img1>, <img2>, ...]
+    if len(sys.argv) >= 6:
+        image_paths = sys.argv[5:]
         for path in image_paths:
             if not os.path.isfile(path):
                 print(f"错误: 图片不存在 - {path}")
                 return
     else:
-        img_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images")
+        img_dir = os.path.join(config.PROJECT_DIR, "images")
         if not os.path.isdir(img_dir):
             os.makedirs(img_dir, exist_ok=True)
             print(f"已创建图片目录: {img_dir}")
-            print("请将待预测的图片放入该目录后重新运行 python main.py predict")
+            print("请将待预测的图片放入该目录后重新运行")
             return
         image_paths = sorted([
             os.path.join(img_dir, f) for f in os.listdir(img_dir)
@@ -132,23 +181,156 @@ def predict():
     for p in image_paths:
         print(f"  - {os.path.basename(p)}")
 
-    # 检查模型权重是否存在
-    if not os.path.isfile(config.MODEL_SAVE_PATH):
-        print(f"\n错误: 模型权重不存在 - {config.MODEL_SAVE_PATH}")
-        print("请先运行 python main.py 完成训练")
+    # 检查模型权重
+    if not os.path.isfile(cfg["model_save_path"]):
+        print(f"\n错误: 模型权重不存在 - {cfg['model_save_path']}")
+        print(f"请先运行 python main.py {dataset_name} {model_name} 完成训练")
         return
 
     device = torch.device(config.DEVICE if torch.cuda.is_available() else "cpu")
-    model = UNet(in_channels=3, out_channels=1, num_filters=config.NUM_FILTERS)
-    model.load_state_dict(torch.load(config.MODEL_SAVE_PATH, map_location=device, weights_only=True))
-    model = model.to(device)
-    print(f"模型已加载 ({device})，开始预测...")
+    model = _load_model(model_name, cfg, device)
+    _print_model_info(model, model_name)
+    print(f"开始预测...")
 
-    predict_custom_images(model, image_paths, device)
+    predict_custom_images(model, image_paths, device, cfg["figure_dir"], model_name)
+
+
+def do_compare(dataset_name):
+    """对比两个模型在指定数据集上的表现"""
+    device = torch.device(config.DEVICE if torch.cuda.is_available() else "cpu")
+    print(f"使用设备: {device}")
+
+    models = ["unet", "segnet"]
+    histories = {}
+
+    for model_name in models:
+        cfg = config.get_config(dataset_name, model_name)
+        # 加载训练历史 JSON
+        history_path = os.path.join(cfg["figure_dir"], f"{model_name}_history.json")
+        if not os.path.isfile(history_path):
+            print(f"\n错误: {model_name.upper()} 的训练历史不存在: {history_path}")
+            print(f"请先运行 python main.py {dataset_name} {model_name} 完成训练")
+            return
+        with open(history_path, "r") as f:
+            histories[model_name] = json.load(f)
+
+        # 检查模型权重
+        if not os.path.isfile(cfg["model_save_path"]):
+            print(f"\n错误: {model_name.upper()} 的模型权重不存在: {cfg['model_save_path']}")
+            print(f"请先运行 python main.py {dataset_name} {model_name} 完成训练")
+            return
+
+    # 1. 终端打印指标对比表
+    print_comparison_table(histories["unet"], histories["segnet"], dataset_name,
+                                     name_a = "U-Net", name_b = "SegNet")
+
+    # 2. 训练曲线对比图
+    compare_training(histories["unet"], histories["segnet"], dataset_name,
+                               cfg["comparison_dir"], name_a="U-Net", name_b="SegNet")
+
+    # 3. 预测结果对比图
+    cfg_unet = config.get_config(dataset_name, "unet")
+    cfg_segnet = config.get_config(dataset_name, "segnet")
+
+    model_unet = _load_model("unet", cfg_unet, device)
+    model_segnet = _load_model("segnet", cfg_segnet, device)
+
+
+    _, val_loader, _ = create_dataloaders(dataset_name, cfg_unet)
+    compare_prediction(model_unet, model_segnet, val_loader, device, dataset_name,
+                         cfg_unet["comparison_dir"], name_a="U-Net", name_b="SegNet", num_samples=3)
+
+
+def _print_compare_table(result_a, result_b, dataset_name, name_a="U-Net", name_b="SegNet"):
+    """在终端打印两个模型在 test 集上的指标对比表"""
+    metrics = [
+        ("Loss",       "test_loss",      False),
+        ("IoU",        "test_iou",       True),
+        ("Pixel Acc",  "test_pixel_acc", True),
+        ("Precision",  "test_precision", True),
+        ("Recall",     "test_recall",    True),
+        ("F1-Score",   "test_f1",        True),
+        ("NLL",        "test_nll",       False),
+        ("ECE",        "test_ece",       False),
+    ]
+
+    print()
+    print("=" * 65)
+    print(f"  {name_a} vs {name_b} — {dataset_name.upper()} Test 对比结果")
+    print("=" * 65)
+    print(f"  {'指标':<14} {name_a:>12}   {name_b:>12}   {'差值':>10}")
+    print("-" * 65)
+
+    for label, key, higher_better in metrics:
+        va = result_a.get(key, 0)
+        vb = result_b.get(key, 0)
+        diff = vb - va
+        sign = "+" if diff >= 0 else ""
+        marker = " *" if (higher_better and va > vb) or (not higher_better and va < vb) else "  "
+        print(f"  {label:<14} {va:>12.4f}   {vb:>12.4f}   {sign}{diff:>9.4f}{marker}")
+
+    print("-" * 65)
+    fps_a = result_a.get("test_fps", 0)
+    fps_b = result_b.get("test_fps", 0)
+    gpu_a = result_a.get("test_gpu_mem", 0)
+    gpu_b = result_b.get("test_gpu_mem", 0)
+    p_a = result_a.get("params", 0)
+    p_b = result_b.get("params", 0)
+
+    print(f"  {'参数量':<14} {p_a:>12,}   {p_b:>12,}   {sign}{p_b - p_a:>9,}")
+    print(f"  {'显存(MB)':<14} {gpu_a:>12.1f}   {gpu_b:>12.1f}   {sign}{gpu_b - gpu_a:>9.1f}")
+    print(f"  {'推理FPS':<14} {fps_a:>12.1f}   {fps_b:>12.1f}   {sign}{fps_b - fps_a:>9.1f}")
+    print("=" * 65)
+    print("  * 表示该指标更优的一方")
+    print()
 
 
 if __name__ == "__main__":
-    if len(sys.argv) >= 2 and sys.argv[1] == "predict":
-        predict()
+    if len(sys.argv) < 2:
+        print_usage()
+        sys.exit(0)
+
+    cmd = sys.argv[1].lower()
+
+    # python main.py <dataset> <model> — 训练
+    if cmd in config.VALID_DATASETS:
+        if len(sys.argv) < 3 or sys.argv[2].lower() not in config.VALID_MODELS:
+            print(f"错误: 请指定模型名称，如: python main.py {cmd} unet")
+            print_usage()
+            sys.exit(1)
+        do_train(cmd, sys.argv[2].lower())
+
+    # python main.py test <dataset> <model>
+    elif cmd == "test":
+        if len(sys.argv) < 4 or sys.argv[2].lower() not in config.VALID_DATASETS \
+                or sys.argv[3].lower() not in config.VALID_MODELS:
+            print("错误: 用法: python main.py test <数据集> <模型>")
+            print("示例: python main.py test camvid unet")
+            print_usage()
+            sys.exit(1)
+        do_test(sys.argv[2].lower(), sys.argv[3].lower())
+
+    # python main.py predict <dataset> <model> [图片...]
+    elif cmd == "predict":
+        if len(sys.argv) < 4 or sys.argv[2].lower() not in config.VALID_DATASETS \
+                or sys.argv[3].lower() not in config.VALID_MODELS:
+            print("错误: 用法: python main.py predict <数据集> <模型> [图片...]")
+            print("示例: python main.py predict camvid unet")
+            print_usage()
+            sys.exit(1)
+        do_predict(sys.argv[2].lower(), sys.argv[3].lower())
+
+    # python main.py compare <dataset>
+    elif cmd == "compare":
+        if len(sys.argv) < 3 or sys.argv[2].lower() not in config.VALID_DATASETS:
+            print("错误: 用法: python main.py compare <数据集>")
+            print("示例: python main.py compare camvid")
+            print("注意: 需要先完成两个模型的训练")
+            print_usage()
+            sys.exit(1)
+        do_compare(sys.argv[2].lower())
+
     else:
-        main()
+        print(f"错误: 未知命令 '{cmd}'")
+        print_usage()
+        sys.exit(1)
