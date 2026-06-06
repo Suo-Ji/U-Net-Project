@@ -35,7 +35,7 @@ DEVICE = "cuda"                  # 使用的设备 ("cuda" 或 "cpu")
 
 # -------------------- 支持的数据集和模型 --------------------
 VALID_DATASETS = ("camvid", "cityscapes")
-VALID_MODELS = ("unet", "segnet", "deeplabv3plus")
+VALID_MODELS = ("unet", "segnet")
 
 
 def get_config(dataset_name, model_name="unet"):
