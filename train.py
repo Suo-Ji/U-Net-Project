@@ -11,8 +11,16 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import config
-from dataset import get_dataset_class
+from dataset import get_dataset_class, get_edge_type_from_model
 from losses import CombinedLoss, compute_all_metrics
+
+
+def _model_forward(model, images, edges, device):
+    """根据模型类型选择 forward 方式"""
+    if getattr(model, 'use_edge', False):
+        return model(images, edges.to(device))
+    else:
+        return model(images)
 
 
 def create_dataloaders(dataset_name, cfg):
@@ -24,18 +32,22 @@ def create_dataloaders(dataset_name, cfg):
         cfg: 数据集配置字典（由 config.get_config() 返回）
     """
     DatasetClass = get_dataset_class(dataset_name)
+    edge_type = get_edge_type_from_model(cfg["model_name"])
 
     train_dataset = DatasetClass(
         data_dir=cfg["data_dir"], split="train",
-        img_size=(config.IMG_HEIGHT, config.IMG_WIDTH), augment=True
+        img_size=(config.IMG_HEIGHT, config.IMG_WIDTH), augment=True,
+        edge_type=edge_type
     )
     val_dataset = DatasetClass(
         data_dir=cfg["data_dir"], split="val",
-        img_size=(config.IMG_HEIGHT, config.IMG_WIDTH), augment=False
+        img_size=(config.IMG_HEIGHT, config.IMG_WIDTH), augment=False,
+        edge_type=edge_type
     )
     test_dataset = DatasetClass(
         data_dir=cfg["data_dir"], split="test",
-        img_size=(config.IMG_HEIGHT, config.IMG_WIDTH), augment=False
+        img_size=(config.IMG_HEIGHT, config.IMG_WIDTH), augment=False,
+        edge_type=edge_type
     )
 
     train_loader = DataLoader(
@@ -62,12 +74,12 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device):
                        "recall": 0.0, "f1": 0.0, "nll": 0.0, "ece": 0.0}
 
     pbar = tqdm(train_loader, desc="  [Train]", leave=False)
-    for images, masks in pbar:
+    for images, masks, edges in pbar:
         images = images.to(device)
         masks = masks.to(device)
 
         # 前向传播
-        outputs = model(images)
+        outputs = _model_forward(model, images, edges, device)
         loss = criterion(outputs, masks)
 
         # 反向传播
@@ -99,11 +111,11 @@ def validate(model, val_loader, criterion, device):
                        "recall": 0.0, "f1": 0.0, "nll": 0.0, "ece": 0.0}
 
     pbar = tqdm(val_loader, desc="  [Val]", leave=False)
-    for images, masks in pbar:
+    for images, masks, edges in pbar:
         images = images.to(device)
         masks = masks.to(device)
 
-        outputs = model(images)
+        outputs = _model_forward(model, images, edges, device)
         loss = criterion(outputs, masks)
 
         metrics = compute_all_metrics(outputs, masks)
@@ -127,11 +139,11 @@ def measure_inference_speed(model, val_loader, device, num_batches=50):
     start_time = time.time()
 
     with torch.no_grad():
-        for i, (images, _) in enumerate(val_loader):
+        for i, (images, _, edges) in enumerate(val_loader):
             if i >= num_batches:
                 break
             images = images.to(device)
-            _ = model(images)
+            _ = _model_forward(model, images, edges, device)
             total_images += images.size(0)
 
     elapsed = time.time() - start_time
@@ -150,9 +162,9 @@ def measure_gpu_memory(model, val_loader, device):
     model.eval()
 
     with torch.no_grad():
-        for images, _ in val_loader:
+        for images, _, edges in val_loader:
             images = images.to(device)
-            _ = model(images)
+            _ = _model_forward(model, images, edges, device)
             break  # 只需要一个 batch 即可测量显存
 
     peak_mem_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
@@ -179,11 +191,11 @@ def evaluate_on_test(model, test_loader, criterion, device):
                        "recall": 0.0, "f1": 0.0, "nll": 0.0, "ece": 0.0}
 
     pbar = tqdm(test_loader, desc="  [Test]", leave=False)
-    for images, masks in pbar:
+    for images, masks, edges in pbar:
         images = images.to(device)
         masks = masks.to(device)
 
-        outputs = model(images)
+        outputs = _model_forward(model, images, edges, device)
         loss = criterion(outputs, masks)
         metrics = compute_all_metrics(outputs, masks)
 

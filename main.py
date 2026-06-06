@@ -14,30 +14,31 @@
 #   python main.py <数据集> <模型>                        训练
 #   python main.py test <数据集> <模型>                  测试可视化
 #   python main.py predict <数据集> <模型> [图片...]      预测
-#   python main.py compare <数据集>                       对比两个模型
+#   python main.py compare <数据集>                       对比所有模型
 #
 #   <数据集>: camvid 或 cityscapes
-#   <模型>:   unet 或 segnet
+#   <模型>:   unet, unet_canny, unet_sobel 或 unet_laplacian
 #
 # ============================================================
+
 
 import os
 import random
 import sys
 import json
 import warnings
+warnings.filterwarnings("ignore", message=".*check_version.*")
 
 import numpy as np
 import torch
 
-warnings.filterwarnings("ignore", message=".*check_version.*")
-
 import config
-from model import UNet, SegNet, get_model_class
+from model import UNet, UNetEdgeAttention, get_model_class
 from train import train, create_dataloaders, measure_inference_speed, measure_gpu_memory, evaluate_on_test
 from visualize import (visualize_prediction, plot_training_history,
                        predict_custom_images, compare_training,
                        compare_prediction, print_comparison_table)
+
 
 
 def set_seed(seed):
@@ -83,10 +84,10 @@ def print_usage():
   python main.py test <数据集> <模型>                   测试可视化
   python main.py predict <数据集> <模型>                批量预测 images/ 下的图片
   python main.py predict <数据集> <模型> <图片1> <图片2> 预测指定图片
-  python main.py compare <数据集>                       对比两个模型
+  python main.py compare <数据集>                       对比所有模型
 
   <数据集>: camvid 或 cityscapes
-  <模型>:   unet 或 segnet
+  <模型>:   unet
 """)
 
 
@@ -199,19 +200,25 @@ def do_predict(dataset_name, model_name):
 
 
 def do_compare(dataset_name):
-    """对比两个模型在指定数据集上的表现"""
+    """对比所有模型在指定数据集上的表现"""
     from losses import CombinedLoss
 
     device = torch.device(config.DEVICE if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}")
 
-    models = ["unet", "segnet"]
+    models = list(config.VALID_MODELS)
+    display_names = {
+        "unet": "U-Net",
+        "unet_canny": "U-Net+Canny",
+        "unet_sobel": "U-Net+Sobel",
+        "unet_laplacian": "U-Net+Laplacian",
+    }
 
     # 检查模型权重
     for model_name in models:
         cfg = config.get_config(dataset_name, model_name)
         if not os.path.isfile(cfg["model_save_path"]):
-            print(f"\n错误: {model_name.upper()} 的模型权重不存在: {cfg['model_save_path']}")
+            print(f"\n错误: {display_names[model_name]} 的模型权重不存在: {cfg['model_save_path']}")
             print(f"请先运行 python main.py {dataset_name} {model_name} 完成训练")
             return
 
@@ -222,15 +229,15 @@ def do_compare(dataset_name):
         loaded_models[model_name] = _load_model(model_name, cfg, device)
 
     # 创建 test 集 DataLoader
-    cfg_ref = config.get_config(dataset_name, "unet")
+    cfg_ref = config.get_config(dataset_name, models[0])
     _, _, test_loader = create_dataloaders(dataset_name, cfg_ref)
     criterion = CombinedLoss(bce_weight=0.5, dice_weight=0.5)
 
-    # 在 test 集上评估两个模型
-    print(f"\n在 test 集上评估两个模型...")
+    # 在 test 集上评估所有模型
+    print(f"\n在 test 集上评估所有模型...")
     test_results = {}
     for model_name in models:
-        print(f"\n  评估 {model_name.upper()}...")
+        print(f"\n  评估 {display_names[model_name]}...")
         result = evaluate_on_test(loaded_models[model_name], test_loader, criterion, device)
         fps = measure_inference_speed(loaded_models[model_name], test_loader, device)
         gpu_mem = measure_gpu_memory(loaded_models[model_name], test_loader, device)
@@ -239,8 +246,8 @@ def do_compare(dataset_name):
         result["params"] = sum(p.numel() for p in loaded_models[model_name].parameters())
         test_results[model_name] = result
 
-    # 1. 终端打印指标对比表（test 集）
-    _print_compare_table(test_results["unet"], test_results["segnet"], dataset_name)
+    # 1. 终端打印指标对比表（test 集，所有模型统一对比）
+    _print_compare_table(test_results, dataset_name, display_names)
 
     # 2. 训练曲线对比图（依赖 JSON，有则绘制，无则跳过）
     histories = {}
@@ -249,23 +256,24 @@ def do_compare(dataset_name):
         history_path = os.path.join(cfg["figure_dir"], f"{model_name}_history.json")
         if os.path.isfile(history_path):
             with open(history_path, "r") as f:
-                histories[model_name] = json.load(f)
+                histories[display_names[model_name]] = json.load(f)
 
-    if len(histories) == 2:
-        compare_training(histories["unet"], histories["segnet"], dataset_name,
-                         cfg_ref["comparison_dir"], name_a="U-Net", name_b="SegNet")
+    if len(histories) >= 2:
+        compare_training(histories, dataset_name, cfg_ref["comparison_dir"])
     else:
-        missing = [m.upper() for m in models if m not in histories]
-        print(f"\n  跳过训练曲线对比（缺少 {', '.join(missing)} 的 history JSON）")
+        print(f"\n  跳过训练曲线对比（需要至少 2 个模型的 history JSON）")
 
-    # 3. 预测结果对比图（test 集）
-    compare_prediction(loaded_models["unet"], loaded_models["segnet"], test_loader, device,
-                       dataset_name, cfg_ref["comparison_dir"],
-                       name_a="U-Net", name_b="SegNet", num_samples=3)
+    # 3. 预测结果对比图（test 集，所有模型统一对比）
+    if len(loaded_models) >= 2:
+        models_for_compare = {display_names[k]: v for k, v in loaded_models.items()}
+        compare_prediction(models_for_compare, test_loader, device,
+                           dataset_name, cfg_ref["comparison_dir"], num_samples=3)
+    else:
+        print(f"\n  跳过预测对比（需要至少 2 个训练好的模型）")
 
 
-def _print_compare_table(result_a, result_b, dataset_name, name_a="U-Net", name_b="SegNet"):
-    """在终端打印两个模型在 test 集上的指标对比表"""
+def _print_compare_table(test_results, dataset_name, display_names):
+    """在终端打印所有模型在 test 集上的统一对比表"""
     metrics = [
         ("Loss",       "test_loss",      False),
         ("IoU",        "test_iou",       True),
@@ -277,34 +285,74 @@ def _print_compare_table(result_a, result_b, dataset_name, name_a="U-Net", name_
         ("ECE",        "test_ece",       False),
     ]
 
+    model_keys = list(test_results.keys())
+    names = [display_names[k] for k in model_keys]
+    n = len(names)
+
+    # 动态计算列宽
+    name_w = max(len(nm) for nm in names)
+    col_w = max(name_w + 2, 12)
+    metric_w = 14
+
+    sep_total = metric_w + 1 + (col_w + 2) * n + 3  # +2 for " *", +3 for " best"
+    line = " " + "=" * sep_total
+    dash = " " + "-" * sep_total
+
     print()
-    print("=" * 65)
-    print(f"  {name_a} vs {name_b} — {dataset_name.upper()} Test 对比结果")
-    print("=" * 65)
-    print(f"  {'指标':<14} {name_a:>12}   {name_b:>12}   {'差值':>10}")
-    print("-" * 65)
+    print(line)
+    title = " vs ".join(names)
+    print(f"  {title} — {dataset_name.upper()} Test 对比结果")
+    print(line)
+
+    # 表头
+    header = f"  {'指标':<{metric_w}}"
+    for name in names:
+        header += f" {name:>{col_w}}"
+    header += " best"
+    print(header)
+    print(dash)
 
     for label, key, higher_better in metrics:
-        va = result_a.get(key, 0)
-        vb = result_b.get(key, 0)
-        diff = vb - va
-        sign = "+" if diff >= 0 else ""
-        marker = " *" if (higher_better and va > vb) or (not higher_better and va < vb) else "  "
-        print(f"  {label:<14} {va:>12.4f}   {vb:>12.4f}   {sign}{diff:>9.4f}{marker}")
+        vals = {k: test_results[k].get(key, 0) for k in model_keys}
+        # 找出最优
+        if higher_better:
+            best_key = max(vals, key=vals.get)
+        else:
+            best_key = min(vals, key=vals.get)
 
-    print("-" * 65)
-    fps_a = result_a.get("test_fps", 0)
-    fps_b = result_b.get("test_fps", 0)
-    gpu_a = result_a.get("test_gpu_mem", 0)
-    gpu_b = result_b.get("test_gpu_mem", 0)
-    p_a = result_a.get("params", 0)
-    p_b = result_b.get("params", 0)
+        row = f"  {label:<{metric_w}}"
+        for k in model_keys:
+            marker = " *" if k == best_key else "  "
+            row += f" {vals[k]:>{col_w}.4f}{marker}"
+        print(row)
 
-    print(f"  {'参数量':<14} {p_a:>12,}   {p_b:>12,}   {sign}{p_b - p_a:>9,}")
-    print(f"  {'显存(MB)':<14} {gpu_a:>12.1f}   {gpu_b:>12.1f}   {sign}{gpu_b - gpu_a:>9.1f}")
-    print(f"  {'推理FPS':<14} {fps_a:>12.1f}   {fps_b:>12.1f}   {sign}{fps_b - fps_a:>9.1f}")
-    print("=" * 65)
-    print("  * 表示该指标更优的一方")
+    # 额外指标
+    print(dash)
+
+    extra = [
+        ("参数量",     "params",       ",",   False),  # 参数量越少越好
+        ("显存(MB)",   "test_gpu_mem", ".1f",  False),
+        ("推理FPS",    "test_fps",     ".1f",  True),
+    ]
+
+    for label, key, fmt, higher_better in extra:
+        vals = {k: test_results[k].get(key, 0) for k in model_keys}
+        if higher_better:
+            best_key = max(vals, key=vals.get)
+        else:
+            best_key = min(vals, key=vals.get)
+
+        row = f"  {label:<{metric_w}}"
+        for k in model_keys:
+            marker = " *" if k == best_key else "  "
+            if fmt == ",":
+                row += f" {int(vals[k]):>{col_w},}{marker}"
+            else:
+                row += f" {vals[k]:>{col_w}{fmt}}{marker}"
+        print(row)
+
+    print(line)
+    print("  * 表示该指标最优的模型")
     print()
 
 
@@ -348,7 +396,7 @@ if __name__ == "__main__":
         if len(sys.argv) < 3 or sys.argv[2].lower() not in config.VALID_DATASETS:
             print("错误: 用法: python main.py compare <数据集>")
             print("示例: python main.py compare camvid")
-            print("注意: 需要先完成两个模型的训练")
+            print("注意: 需要先完成所有模型的训练")
             print_usage()
             sys.exit(1)
         do_compare(sys.argv[2].lower())

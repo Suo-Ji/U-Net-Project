@@ -1,6 +1,6 @@
 # ============================================================
 # 语义分割模型定义
-# 支持: U-Net, SegNet
+# 支持: U-Net (含边缘注意力变体)
 # ============================================================
 
 import torch
@@ -111,110 +111,79 @@ class UNet(nn.Module):
 
 
 # ============================================================
-# SegNet 模型
-# 论文: "SegNet: A Deep Convolutional Encoder-Decoder Architecture
-#        for Image Segmentation"
-# 核心特点：解码器使用编码器 MaxPool 的索引进行上采样（池化索引上采样）
+# 边缘注意力模块 + U-Net 边缘注意力变体
 # ============================================================
 
-class SegNetDown(nn.Module):
-    """SegNet 编码器块：Conv*2 -> BN -> ReLU -> MaxPool（记录索引）"""
-
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-        )
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2, return_indices=True)
-
-    def forward(self, x):
-        x = self.conv(x)
-        x, indices = self.pool(x)
-        return x, indices
-
-
-class SegNetUp(nn.Module):
-    """SegNet 解码器块：MaxUnpool（使用编码器索引）-> Conv*2 -> BN -> ReLU"""
-
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.unpool = nn.MaxUnpool2d(kernel_size=2, stride=2)
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x, indices, output_size):
-        x = self.unpool(x, indices, output_size=output_size)
-        x = self.conv(x)
-        return x
-
-
-class SegNet(nn.Module):
+class EdgeSE(nn.Module):
     """
-    SegNet 模型
-    输入: (B, in_channels, H, W) 的图像张量
-    输出: (B, out_channels, H, W) 的分割概率图
+    边缘注意力模块（SE-Block 风格）
+    用边缘图引导编码器特征的通道权重
 
-    与 U-Net 的区别：
-    - 解码器不使用转置卷积，而是用 MaxUnpool2d + 编码器池化索引恢复分辨率
-    - 不传递编码器特征图（仅传索引），参数量更少、显存更省
+    edge_map (B,1,H,W) → GAP → FC → ReLU → FC → Sigmoid → channel_weights (B,C,1,1)
+    feature_map (B,C,H,W) × channel_weights → weighted_feature_map
+    """
+
+    def __init__(self, channels, reduction=4):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(1, channels // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels),
+            nn.Sigmoid()
+        )
+
+    def forward(self, feature_map, edge_map):
+        """
+        参数:
+            feature_map: (B, C, H, W) 编码器特征
+            edge_map: (B, 1, H, W) 边缘图
+        """
+        # 边缘图全局平均池化 → (B, 1)
+        edge_pooled = edge_map.mean(dim=[2, 3])  # (B, 1)
+        # 通过 FC 生成通道权重
+        weights = self.fc(edge_pooled)            # (B, C)
+        weights = weights.unsqueeze(-1).unsqueeze(-1)  # (B, C, 1, 1)
+        return feature_map * weights
+
+
+class UNetEdgeAttention(UNet):
+    """
+    U-Net 边缘注意力变体
+    在编码器 inc 层之后插入 EdgeSE 模块
+
+    forward(x, edge_map) 接收边缘图作为额外输入
     """
 
     def __init__(self, in_channels=3, out_channels=1, num_filters=64):
-        super().__init__()
+        super().__init__(in_channels, out_channels, num_filters)
+        f = num_filters
+        self.edge_se = EdgeSE(f)
+        self.use_edge = True  # 标记，供 train.py 判断
 
-        f = num_filters  # 64
+    def forward(self, x, edge_map):
+        # 编码器（inc 后插入边缘注意力）
+        x1 = self.inc(x)              # (B, 64, H, W)
+        x1 = self.edge_se(x1, edge_map)  # 边缘注意力加权
 
-        # 编码器
-        self.enc1 = SegNetDown(in_channels, f)         # 3   -> 64
-        self.enc2 = SegNetDown(f, f * 2)               # 64  -> 128
-        self.enc3 = SegNetDown(f * 2, f * 4)           # 128 -> 256
-        self.enc4 = SegNetDown(f * 4, f * 8)           # 256 -> 512
-        self.enc5 = SegNetDown(f * 8, f * 16)          # 512 -> 1024
+        x2 = self.down1(x1)           # (B, 128, H/2, W/2)
+        x3 = self.down2(x2)           # (B, 256, H/4, W/4)
+        x4 = self.down3(x3)           # (B, 512, H/8, W/8)
+        x5 = self.down4(x4)           # (B, 1024, H/16, W/16)
 
-        # 解码器
-        self.dec5 = SegNetUp(f * 16, f * 8)            # 1024 -> 512
-        self.dec4 = SegNetUp(f * 8, f * 4)             # 512  -> 256
-        self.dec3 = SegNetUp(f * 4, f * 2)             # 256  -> 128
-        self.dec2 = SegNetUp(f * 2, f)                 # 128  -> 64
-        self.dec1 = SegNetUp(f, f)                     # 64   -> 64
+        # 解码器 + 跳跃连接
+        x = self.up1(x5, x4)
+        x = self.up2(x, x3)
+        x = self.up3(x, x2)
+        x = self.up4(x, x1)
 
-        # 输出层
-        self.outc = nn.Conv2d(f, out_channels, kernel_size=1)
-
-    def forward(self, x):
-        # 编码器（记录每层池化索引和输出尺寸）
-        e1, idx1 = self.enc1(x)    # (B, 64,  H/2,  W/2)
-        e2, idx2 = self.enc2(e1)   # (B, 128, H/4,  W/4)
-        e3, idx3 = self.enc3(e2)   # (B, 256, H/8,  W/8)
-        e4, idx4 = self.enc4(e3)   # (B, 512, H/16, W/16)
-        e5, idx5 = self.enc5(e4)   # (B, 1024,H/32, W/32)
-
-        # 解码器（使用编码器池化索引上采样）
-        d5 = self.dec5(e5, idx5, output_size=e4.size())   # (B, 512, H/16, W/16)
-        d4 = self.dec4(d5, idx4, output_size=e3.size())   # (B, 256, H/8,  W/8)
-        d3 = self.dec3(d4, idx3, output_size=e2.size())   # (B, 128, H/4,  W/4)
-        d2 = self.dec2(d3, idx2, output_size=e1.size())   # (B, 64,  H/2,  W/2)
-        d1 = self.dec1(d2, idx1, output_size=x.size())    # (B, 64,  H,    W)
-
-        return self.outc(d1)    # (B, 1,   H,    W)
+        return self.outc(x)
 
 
 # ============================================================
 # 模型工厂函数
 # ============================================================
 
-VALID_MODELS = ("unet", "segnet")
+VALID_MODELS = ("unet", "unet_canny", "unet_sobel", "unet_laplacian")
 
 
 def get_model_class(model_name):
@@ -222,15 +191,15 @@ def get_model_class(model_name):
     根据模型名称返回对应的模型类
 
     参数:
-        model_name: "unet" 或 "segnet"
+        model_name: "unet" / "unet_canny" / "unet_sobel" / "unet_laplacian"
 
     返回:
-        对应的模型类（UNet 或 SegNet）
+        对应的模型类
     """
     model_name = model_name.lower()
     if model_name == "unet":
         return UNet
-    elif model_name == "segnet":
-        return SegNet
+    elif model_name in ("unet_canny", "unet_sobel", "unet_laplacian"):
+        return UNetEdgeAttention
     else:
         raise ValueError(f"不支持的模型: {model_name}，可选: {VALID_MODELS}")

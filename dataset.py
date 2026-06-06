@@ -10,8 +10,67 @@ import torch
 from torch.utils.data import Dataset
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
+import cv2
 
 import config
+
+
+# ============================================================
+# 边缘检测工具函数
+# ============================================================
+
+def compute_edge_map(image_rgb, edge_type):
+    """
+    从 RGB 图像计算边缘图
+
+    参数:
+        image_rgb: numpy 数组 (H, W, 3), uint8
+        edge_type: "canny" / "sobel" / "laplacian" / None
+
+    返回:
+        numpy 数组 (H, W), float32, 归一化到 [0, 1]；edge_type=None 时返回全零
+    """
+    if edge_type is None:
+        return np.zeros(image_rgb.shape[:2], dtype=np.float32)
+
+    gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+
+    if edge_type == "canny":
+        edge = cv2.Canny(gray, 50, 150)
+    elif edge_type == "sobel":
+        sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        edge = np.sqrt(sobel_x ** 2 + sobel_y ** 2)
+    elif edge_type == "laplacian":
+        edge = cv2.Laplacian(gray, cv2.CV_64F)
+        edge = np.abs(edge)
+    else:
+        raise ValueError(f"不支持的边缘类型: {edge_type}")
+
+    # 归一化到 [0, 1]
+    edge = edge.astype(np.float32)
+    max_val = edge.max()
+    if max_val > 0:
+        edge = edge / max_val
+    return edge
+
+
+def get_edge_type_from_model(model_name):
+    """
+    从模型名称推导边缘类型
+
+    参数:
+        model_name: "unet" / "unet_canny" / "unet_sobel" / "unet_laplacian"
+
+    返回:
+        edge_type: "canny" / "sobel" / "laplacian" / None
+    """
+    edge_models = {
+        "unet_canny": "canny",
+        "unet_sobel": "sobel",
+        "unet_laplacian": "laplacian",
+    }
+    return edge_models.get(model_name)
 
 # ============================================================
 # CamVid 数据集
@@ -37,11 +96,12 @@ class CamVidDataset(Dataset):
     掩膜处理：将灰度索引掩膜转换为二值掩膜（道路=1，非道路=0）
     """
 
-    def __init__(self, data_dir, split="train", img_size=(256, 256), augment=False):
+    def __init__(self, data_dir, split="train", img_size=(256, 256), augment=False, edge_type=None):
         self.data_dir = data_dir
         self.split = split
         self.img_size = img_size
         self.augment = augment
+        self.edge_type = edge_type
 
         # 构建图像和标签目录路径
         img_dir = os.path.join(data_dir, split)
@@ -107,7 +167,8 @@ class CamVidDataset(Dataset):
             ToTensorV2(),
         ])
 
-        return A.Compose(transform_list)
+        # edge_map 作为额外的 mask 类型，同步进行空间变换
+        return A.Compose(transform_list, additional_targets={'edge': 'mask'})
 
     def _mask_to_binary(self, mask_gray):
         """
@@ -126,8 +187,11 @@ class CamVidDataset(Dataset):
         # 加载灰度索引标签（单通道，每个像素值为类别索引）
         mask = np.array(Image.open(self.masks[idx]))
 
-        # 应用数据增强与预处理
-        augmented = self.transform(image=image, mask=mask)
+        # 在 transform 之前计算边缘图（边缘算子需要 uint8 输入）
+        edge = compute_edge_map(image, self.edge_type)
+
+        # 应用数据增强与预处理（edge 同步进行空间变换）
+        augmented = self.transform(image=image, mask=mask, edge=edge)
         image_tensor = augmented["image"]        # (3, H, W), 归一化后的 Tensor
 
         # ToTensorV2 会将 mask 转为 Tensor，需要转回 numpy 以便二值化处理
@@ -141,7 +205,10 @@ class CamVidDataset(Dataset):
         binary_mask = self._mask_to_binary(mask_arr)
         mask_tensor = torch.from_numpy(binary_mask).unsqueeze(0)  # (1, H, W)
 
-        return image_tensor, mask_tensor
+        # 边缘图转为 Tensor
+        edge_tensor = augmented["edge"].float().unsqueeze(0)  # (1, H, W)
+
+        return image_tensor, mask_tensor, edge_tensor
 
 
 # ============================================================
@@ -172,11 +239,12 @@ class CityscapesDataset(Dataset):
     掩膜处理：将 _gtFine_labelIds.png 转换为二值掩膜（道路=1，非道路=0）
     """
 
-    def __init__(self, data_dir, split="train", img_size=(256, 256), augment=False):
+    def __init__(self, data_dir, split="train", img_size=(256, 256), augment=False, edge_type=None):
         self.data_dir = data_dir
         self.split = split
         self.img_size = img_size
         self.augment = augment
+        self.edge_type = edge_type
 
         # 构建图像根目录：leftImg8bit/{split}/
         img_split_dir = os.path.join(data_dir, CITYSCAPES_IMG_DIR_NAME, split)
@@ -244,7 +312,8 @@ class CityscapesDataset(Dataset):
             ToTensorV2(),
         ])
 
-        return A.Compose(transform_list)
+        # edge_map 作为额外的 mask 类型，同步进行空间变换
+        return A.Compose(transform_list, additional_targets={'edge': 'mask'})
 
     def _mask_to_binary(self, mask_gray):
         """
@@ -263,8 +332,11 @@ class CityscapesDataset(Dataset):
         # 加载灰度索引标签
         mask = np.array(Image.open(self.masks[idx]))
 
-        # 应用数据增强与预处理
-        augmented = self.transform(image=image, mask=mask)
+        # 在 transform 之前计算边缘图（边缘算子需要 uint8 输入）
+        edge = compute_edge_map(image, self.edge_type)
+
+        # 应用数据增强与预处理（edge 同步进行空间变换）
+        augmented = self.transform(image=image, mask=mask, edge=edge)
         image_tensor = augmented["image"]
 
         # ToTensorV2 会将 mask 转为 Tensor，需要转回 numpy 以便二值化处理
@@ -278,7 +350,10 @@ class CityscapesDataset(Dataset):
         binary_mask = self._mask_to_binary(mask_arr)
         mask_tensor = torch.from_numpy(binary_mask).unsqueeze(0)  # (1, H, W)
 
-        return image_tensor, mask_tensor
+        # 边缘图转为 Tensor
+        edge_tensor = augmented["edge"].float().unsqueeze(0)  # (1, H, W)
+
+        return image_tensor, mask_tensor, edge_tensor
 
 
 # ============================================================
