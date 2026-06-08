@@ -37,7 +37,8 @@ from model import UNet, UNetEdgeAttention, get_model_class
 from train import train, create_dataloaders, measure_inference_speed, measure_gpu_memory, evaluate_on_test
 from visualize import (visualize_prediction, plot_training_history,
                        predict_custom_images, compare_training,
-                       compare_prediction, print_comparison_table)
+                       compare_prediction, print_comparison_table,
+                       visualize_edge_detection)
 
 
 
@@ -85,6 +86,7 @@ def print_usage():
   python main.py predict <数据集> <模型>                批量预测 images/ 下的图片
   python main.py predict <数据集> <模型> <图片1> <图片2> 预测指定图片
   python main.py compare <数据集>                       对比所有模型
+  python main.py edge                                   显示边缘检测对比图
 
   <数据集>: camvid 或 cityscapes
   <模型>:   unet
@@ -408,6 +410,15 @@ if __name__ == "__main__":
             print_usage()
             sys.exit(1)
         do_compare(sys.argv[2].lower())
+
+    # python main.py edge
+    elif cmd == "edge":
+        image_dir = os.path.join(config.PROJECT_DIR, "images")
+        if not os.path.isdir(image_dir) or not os.listdir(image_dir):
+            print(f"错误: images/ 目录中没有图片")
+            sys.exit(1)
+        comparison_dir = os.path.join(config.PROJECT_DIR, "figure", "comparison")
+        visualize_edge_detection(image_dir, comparison_dir)
 
     else:
         print(f"错误: 未知命令 '{cmd}'")

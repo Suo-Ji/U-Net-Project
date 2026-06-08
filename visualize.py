@@ -7,6 +7,7 @@
 import os
 import random
 import numpy as np
+import cv2
 import matplotlib.pyplot as plt
 import torch
 from PIL import Image
@@ -443,3 +444,62 @@ def print_comparison_table(histories, dataset_name):
     print(line)
     print("  * 表示该指标最优的模型")
     print()
+
+
+def visualize_edge_detection(image_dir, save_dir):
+    """
+    对指定目录下的图片生成 Canny / Sobel / Laplacian 三种边缘检测结果的可视化对比图
+
+    参数:
+        image_dir: 图片目录路径（扫描其中所有 png/jpg/jpeg/bmp 文件）
+        save_dir:  图片保存目录
+    """
+    from dataset import compute_edge_map
+
+    EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp')
+
+    # 收集图片
+    image_paths = sorted([
+        os.path.join(image_dir, f) for f in os.listdir(image_dir)
+        if f.lower().endswith(EXTENSIONS)
+    ])
+    if not image_paths:
+        print(f"目录 {image_dir} 中没有找到图片")
+        return
+
+    n = len(image_paths)
+    # 4 列：原图 / Canny / Sobel / Laplacian
+    fig, axes = plt.subplots(n, 4, figsize=(24, 5 * n))
+    if n == 1:
+        axes = axes[np.newaxis, :]
+
+    edge_types = [
+        ("canny", "Canny"),
+        ("sobel", "Sobel"),
+        ("laplacian", "Laplacian"),
+    ]
+
+    for row, path in enumerate(image_paths):
+        image_rgb = np.array(Image.open(path).convert("RGB"))
+        image_rgb = cv2.resize(image_rgb, (config.IMG_WIDTH, config.IMG_HEIGHT))
+
+        # 原图
+        axes[row, 0].imshow(image_rgb)
+        axes[row, 0].set_title(f"Input: {os.path.basename(path)}", fontsize=13)
+        axes[row, 0].axis("off")
+
+        # 三种边缘检测结果
+        for col, (edge_type, title) in enumerate(edge_types, start=1):
+            edge_map = compute_edge_map(image_rgb, edge_type)
+            axes[row, col].imshow(edge_map, cmap="gray", vmin=0, vmax=1)
+            axes[row, col].set_title(title, fontsize=13)
+            axes[row, col].axis("off")
+
+    plt.suptitle("Edge Detection Comparison — Canny vs Sobel vs Laplacian",
+                 fontsize=16, fontweight="bold")
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, "edge_detection_comparison.png")
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    print(f"边缘检测对比已保存至 {save_path}")
+    plt.show()
