@@ -228,19 +228,21 @@ def do_compare(dataset_name):
         cfg = config.get_config(dataset_name, model_name)
         loaded_models[model_name] = _load_model(model_name, cfg, device)
 
-    # 创建 test 集 DataLoader
+    # 创建 DataLoader：CamVid 使用 test 集，Cityscapes 使用 val 集（test 集 GT 不完整）
     cfg_ref = config.get_config(dataset_name, models[0])
-    _, _, test_loader = create_dataloaders(dataset_name, cfg_ref)
+    _, val_loader, test_loader = create_dataloaders(dataset_name, cfg_ref)
+    eval_loader = val_loader if dataset_name == "cityscapes" else test_loader
+    eval_set_name = "val" if dataset_name == "cityscapes" else "test"
     criterion = CombinedLoss(bce_weight=0.5, dice_weight=0.5)
 
-    # 在 test 集上评估所有模型
-    print(f"\n在 test 集上评估所有模型...")
+    # 在评估集上评估所有模型
+    print(f"\n在 {eval_set_name} 集上评估所有模型...")
     test_results = {}
     for model_name in models:
         print(f"\n  评估 {display_names[model_name]}...")
-        result = evaluate_on_test(loaded_models[model_name], test_loader, criterion, device)
-        fps = measure_inference_speed(loaded_models[model_name], test_loader, device)
-        gpu_mem = measure_gpu_memory(loaded_models[model_name], test_loader, device)
+        result = evaluate_on_test(loaded_models[model_name], eval_loader, criterion, device)
+        fps = measure_inference_speed(loaded_models[model_name], eval_loader, device)
+        gpu_mem = measure_gpu_memory(loaded_models[model_name], eval_loader, device)
         result["test_fps"] = fps
         result["test_gpu_mem"] = gpu_mem
         result["params"] = sum(p.numel() for p in loaded_models[model_name].parameters())
@@ -259,14 +261,20 @@ def do_compare(dataset_name):
                 histories[display_names[model_name]] = json.load(f)
 
     if len(histories) >= 2:
-        compare_training(histories, dataset_name, cfg_ref["comparison_dir"])
+        # 训练曲线对比仅绘制 U-Net vs U-Net+Laplacian
+        curve_compare_keys = [display_names["unet"], display_names["unet_laplacian"]]
+        curve_histories = {k: histories[k] for k in curve_compare_keys if k in histories}
+        if len(curve_histories) >= 2:
+            compare_training(curve_histories, dataset_name, cfg_ref["comparison_dir"])
+        else:
+            compare_training(histories, dataset_name, cfg_ref["comparison_dir"])
     else:
         print(f"\n  跳过训练曲线对比（需要至少 2 个模型的 history JSON）")
 
-    # 3. 预测结果对比图（test 集，所有模型统一对比）
+    # 3. 预测结果对比图（评估集，所有模型统一对比）
     if len(loaded_models) >= 2:
         models_for_compare = {display_names[k]: v for k, v in loaded_models.items()}
-        compare_prediction(models_for_compare, test_loader, device,
+        compare_prediction(models_for_compare, eval_loader, device,
                            dataset_name, cfg_ref["comparison_dir"], num_samples=3)
     else:
         print(f"\n  跳过预测对比（需要至少 2 个训练好的模型）")
