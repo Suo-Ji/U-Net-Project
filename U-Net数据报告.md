@@ -1,7 +1,7 @@
 # U-Net 边缘注意力道路语义分割 — 数据报告
 
 **实验模型：** U-Net、U-Net+Canny、U-Net+Sobel、U-Net+Laplacian
-**评估日期：** 2026-06-08
+**评估日期：** 2026-06-09
 **训练配置：** 30 Epochs, Batch Size 8, Adam lr=1e-4, Loss=0.5×BCE + 0.5×Dice, 输入尺寸 256×256
 **模型参数：** num_filters=64，标准 U-Net 约 31M 参数，边缘注意力变体约 31M+2.4K 参数
 
@@ -9,6 +9,26 @@
 - 以下指标来自各模型训练历史 JSON 中最后一个 epoch 的验证集指标（val 集评估）
 - `compare` 对比模式中，CamVid 使用 **test 集**进行评估和预测对比，Cityscapes 使用 **val 集**（因 test 集 GT 不完整）
 - 训练曲线对比折线图仅绘制 **U-Net vs U-Net+Laplacian**，突出基线与最优变体的差距
+
+---
+
+## 〇、实验环境
+
+| 项目 | 配置 |
+|---|---|
+| **Python** | 3.10.19 |
+| **PyTorch** | 2.5.1 |
+| **CUDA** | 12.1 |
+| **GPU** | NVIDIA GeForce RTX 3060 Laptop GPU |
+| **GPU 显存** | 6.0 GB |
+| **操作系统** | Windows 10 |
+| **输入尺寸** | 256×256 |
+| **Batch Size** | 8 |
+| **Epochs** | 30 |
+| **学习率** | 1e-4 |
+| **优化器** | Adam (weight_decay=1e-8) |
+| **学习率调度** | ReduceLROnPlateau (factor=0.5, patience=5) |
+| **随机种子** | 42 |
 
 ---
 

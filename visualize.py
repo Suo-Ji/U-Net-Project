@@ -145,8 +145,16 @@ def predict_custom_images(model, image_paths, device, save_dir, model_name="mode
     """
     import albumentations as A
     from albumentations.pytorch import ToTensorV2
+    from dataset import compute_edge_map
 
     model.eval()
+
+    # 判断是否为边缘注意力模型，提取边缘类型
+    use_edge = getattr(model, 'use_edge', False)
+    if use_edge and "_" in model_name:
+        edge_type = model_name.split("_", 1)[1]  # "unet_canny" → "canny"
+    else:
+        edge_type = None
 
     # 预处理管道（与测试时一致：Resize + Normalize + ToTensor）
     transform = A.Compose([
@@ -192,7 +200,14 @@ def predict_custom_images(model, image_paths, device, save_dir, model_name="mode
         input_tensor = augmented["image"].unsqueeze(0).to(device)
 
         with torch.no_grad():
-            pred = torch.sigmoid(model(input_tensor))
+            if use_edge and edge_type:
+                raw_resized = cv2.resize(np.array(Image.open(path).convert("RGB")),
+                                         (config.IMG_WIDTH, config.IMG_HEIGHT))
+                edge_map = compute_edge_map(raw_resized, edge_type)
+                edge_tensor = torch.from_numpy(edge_map).unsqueeze(0).unsqueeze(0).to(device)
+                pred = torch.sigmoid(model(input_tensor, edge_tensor))
+            else:
+                pred = torch.sigmoid(model(input_tensor))
             pred_mask = (pred > 0.5).float()
 
         img_np = denormalize(input_tensor[0])

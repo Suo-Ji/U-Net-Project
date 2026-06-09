@@ -28,6 +28,7 @@ import sys
 import json
 import warnings
 warnings.filterwarnings("ignore", message=".*check_version.*")
+os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
 
 import numpy as np
 import torch
@@ -206,7 +207,25 @@ def do_compare(dataset_name):
     from losses import CombinedLoss
 
     device = torch.device(config.DEVICE if torch.cuda.is_available() else "cpu")
-    print(f"使用设备: {device}")
+
+    # 打印环境配置信息
+    print("=" * 60)
+    print("  环境配置信息")
+    print("=" * 60)
+    print(f"  Python:       {sys.version.split()[0]}")
+    print(f"  PyTorch:      {torch.__version__}")
+    print(f"  CUDA:         {torch.version.cuda if torch.cuda.is_available() else 'N/A'}")
+    if torch.cuda.is_available():
+        print(f"  GPU:          {torch.cuda.get_device_name(0)}")
+        gpu_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"  GPU 显存:     {gpu_total:.1f} GB")
+    print(f"  计算设备:     {device}")
+    print(f"  图像尺寸:     {config.IMG_HEIGHT}×{config.IMG_WIDTH}")
+    print(f"  Batch Size:   {config.BATCH_SIZE}")
+    print(f"  Epochs:       {config.NUM_EPOCHS}")
+    print(f"  学习率:       {config.LEARNING_RATE}")
+    print(f"  随机种子:     {config.SEED}")
+    print("=" * 60)
 
     models = list(config.VALID_MODELS)
     display_names = {

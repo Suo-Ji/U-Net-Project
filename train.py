@@ -235,7 +235,7 @@ def train(model, device, dataset_name, model_name, cfg):
     optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=config.LR_SCHEDULER_FACTOR,
-        patience=config.LR_SCHEDULER_PATIENCE, verbose=False
+        patience=config.LR_SCHEDULER_PATIENCE
     )
 
     # 训练循环

@@ -44,7 +44,7 @@ def get_config(dataset_name, model_name="unet"):
 
     参数:
         dataset_name: 数据集名称，"camvid" 或 "cityscapes"
-        model_name: 模型名称，"unet" 或 "segnet"
+        model_name: 模型名称，"unet"、"unet_canny"、"unet_sobel" 或 "unet_laplacian"
 
     返回:
         dict: 包含 data_dir, model_save_path, figure_dir 等配置
